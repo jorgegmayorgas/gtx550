@@ -1,183 +1,165 @@
-# gpu_kernels.py
 import numpy as np
-import cv2
 
-# Intentar importar PyCUDA (entorno legacy GTX 550 + CUDA 8)
-try:
-    import pycuda.driver as cuda
-    import pycuda.autoinit  # crea contexto al importar
-    from pycuda.compiler import SourceModule
+import pycuda.autoinit  # crea el contexto CUDA al importar
+import pycuda.driver as cuda
+from pycuda.compiler import SourceModule
 
-    HAS_PYCUDA = True
-except ImportError:
-    HAS_PYCUDA = False
+# Kernels CUDA sencillos para imágenes uint8 (0–255), BGR o RGB de 3 canales
 
+KERNEL_CODE = r"""
+extern "C" {
 
-# =========================
-#   KERNELS GPU (PyCUDA)
-# =========================
+__global__ void invert_kernel(unsigned char *img, int width, int height, int channels)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = width * height * channels;
 
-if HAS_PYCUDA:
-    KERNEL_CODE = r"""
-    __global__ void invert(unsigned char* img, int width, int height, int channels) {
-        int x = blockDim.x * blockIdx.x + threadIdx.x;
-        int y = blockDim.y * blockIdx.y + threadIdx.y;
-
-        if (x >= width || y >= height) return;
-
-        int idx = (y * width + x) * channels;
-        for (int c = 0; c < channels; ++c) {
-            img[idx + c] = 255 - img[idx + c];
-        }
+    if (idx < total)
+    {
+        img[idx] = 255 - img[idx];
     }
+}
 
-    __global__ void adjust_brightness(unsigned char* img, int width, int height, int channels,
-                                      float alpha, float beta) {
-        int x = blockDim.x * blockIdx.x + threadIdx.x;
-        int y = blockDim.y * blockIdx.y + threadIdx.y;
+__global__ void brightness_kernel(unsigned char *img, int width, int height, int channels, int delta)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = width * height * channels;
 
-        if (x >= width || y >= height) return;
-
-        int idx = (y * width + x) * channels;
-        for (int c = 0; c < channels; ++c) {
-            float val = img[idx + c];
-            val = alpha * val + beta;
-            if (val < 0.0f) val = 0.0f;
-            if (val > 255.0f) val = 255.0f;
-            img[idx + c] = (unsigned char)(val);
-        }
+    if (idx < total)
+    {
+        int val = (int)img[idx] + delta;
+        if (val < 0) val = 0;
+        if (val > 255) val = 255;
+        img[idx] = (unsigned char)val;
     }
+}
 
-    __global__ void adjust_contrast(unsigned char* img, int width, int height, int channels,
-                                    float alpha, float midpoint) {
-        int x = blockDim.x * blockIdx.x + threadIdx.x;
-        int y = blockDim.y * blockIdx.y + threadIdx.y;
+__global__ void contrast_kernel(unsigned char *img, int width, int height, int channels, float alpha)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = width * height * channels;
 
-        if (x >= width || y >= height) return;
+    if (idx < total)
+    {
+        // Ajuste simple: nuevo = 128 + alpha * (valor - 128)
+        float val = (float)img[idx];
+        val = 128.0f + alpha * (val - 128.0f);
 
-        int idx = (y * width + x) * channels;
-        for (int c = 0; c < channels; ++c) {
-            float val = img[idx + c];
-            val = (val - midpoint) * alpha + midpoint;
-            if (val < 0.0f) val = 0.0f;
-            if (val > 255.0f) val = 255.0f;
-            img[idx + c] = (unsigned char)(val);
-        }
+        if (val < 0.0f) val = 0.0f;
+        if (val > 255.0f) val = 255.0f;
+        img[idx] = (unsigned char)val;
     }
-    """
+}
 
-    _mod = SourceModule(KERNEL_CODE)
-    _invert_kernel = _mod.get_function("invert")
-    _brightness_kernel = _mod.get_function("adjust_brightness")
-    _contrast_kernel = _mod.get_function("adjust_contrast")
+}
+"""
+
+# Compilar los kernels con nvcc usando g++-5
+# IMPORTANTE: asegúrate de tener instalado /usr/bin/g++-5
+#   sudo apt install gcc-5 g++-5
+
+_mod = SourceModule(
+    KERNEL_CODE,
+    options=["-ccbin", "/usr/bin/g++-5"]
+)
+
+_invert_kernel = _mod.get_function("invert_kernel")
+_brightness_kernel = _mod.get_function("brightness_kernel")
+_contrast_kernel = _mod.get_function("contrast_kernel")
 
 
-def _check_image(image: np.ndarray):
+def _ensure_uint8_3ch(image: np.ndarray) -> np.ndarray:
+    """Asegura que la imagen es uint8 y 3 canales (H, W, 3)."""
     if image.dtype != np.uint8:
-        raise ValueError("Image must be uint8")
-    if image.ndim != 3:
-        raise ValueError("Expected HxWxC image")
+        image = image.astype(np.uint8)
 
+    if image.ndim == 2:
+        # gris -> 3 canales replicados
+        image = np.stack([image] * 3, axis=-1)
 
-# =========================
-#   API PÚBLICA
-# =========================
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError(f"Se esperaba imagen (H, W, 3). Shape recibida: {image.shape}")
+
+    return image
+
 
 def gpu_invert(image: np.ndarray) -> np.ndarray:
-    """
-    Invierte colores. Usa GPU si PyCUDA está disponible, si no CPU (OpenCV).
-    """
-    _check_image(image)
+    """Invierte los colores de la imagen en la GPU."""
+    img = _ensure_uint8_3ch(image).copy()
 
-    # Fallback CPU si no hay PyCUDA (portátil Kubuntu 24.04, etc.)
-    if not HAS_PYCUDA:
-        return cv2.bitwise_not(image)
+    height, width, channels = img.shape
+    total = width * height * channels
 
-    height, width, channels = image.shape
-    img_flat = image.copy()
+    # Reservar memoria en GPU
+    img_gpu = cuda.mem_alloc(img.nbytes)
 
-    img_gpu = cuda.mem_alloc(img_flat.nbytes)
-    cuda.memcpy_htod(img_gpu, img_flat)
+    # Copiar a GPU
+    cuda.memcpy_htod(img_gpu, img)
 
-    block = (16, 16, 1)
-    grid = ((width + block[0] - 1) // block[0],
-            (height + block[1] - 1) // block[1],
-            1)
+    # Configurar grid/bloques
+    threads_per_block = 256
+    blocks = (total + threads_per_block - 1) // threads_per_block
 
+    # Lanzar kernel
     _invert_kernel(
         img_gpu,
         np.int32(width),
         np.int32(height),
         np.int32(channels),
-        block=block,
-        grid=grid,
+        block=(threads_per_block, 1, 1),
+        grid=(blocks, 1, 1),
     )
 
-    result = np.empty_like(img_flat)
+    # Copiar resultado de vuelta
+    result = np.empty_like(img)
     cuda.memcpy_dtoh(result, img_gpu)
+
     img_gpu.free()
     return result
 
 
-def gpu_brightness(image: np.ndarray, alpha: float = 1.2, beta: float = 10.0) -> np.ndarray:
-    """
-    Ajusta brillo/contraste simple. GPU si hay PyCUDA, CPU si no.
-    """
-    _check_image(image)
+def gpu_brightness(image: np.ndarray, delta: int) -> np.ndarray:
+    """Ajusta brillo en la GPU. delta puede ser positivo o negativo."""
+    img = _ensure_uint8_3ch(image).copy()
 
-    if not HAS_PYCUDA:
-        # CPU: alpha = factor contraste, beta = brillo
-        return cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+    height, width, channels = img.shape
+    total = width * height * channels
 
-    height, width, channels = image.shape
-    img_flat = image.copy()
+    img_gpu = cuda.mem_alloc(img.nbytes)
+    cuda.memcpy_htod(img_gpu, img)
 
-    img_gpu = cuda.mem_alloc(img_flat.nbytes)
-    cuda.memcpy_htod(img_gpu, img_flat)
-
-    block = (16, 16, 1)
-    grid = ((width + block[0] - 1) // block[0],
-            (height + block[1] - 1) // block[1],
-            1)
+    threads_per_block = 256
+    blocks = (total + threads_per_block - 1) // threads_per_block
 
     _brightness_kernel(
         img_gpu,
         np.int32(width),
         np.int32(height),
         np.int32(channels),
-        np.float32(alpha),
-        np.float32(beta),
-        block=block,
-        grid=grid,
+        np.int32(delta),
+        block=(threads_per_block, 1, 1),
+        grid=(blocks, 1, 1),
     )
 
-    result = np.empty_like(img_flat)
+    result = np.empty_like(img)
     cuda.memcpy_dtoh(result, img_gpu)
+
     img_gpu.free()
     return result
 
 
-def gpu_contrast(image: np.ndarray, alpha: float = 1.3, midpoint: float = 127.0) -> np.ndarray:
-    """
-    Ajusta contraste alrededor de un punto medio. GPU si hay PyCUDA, CPU si no.
-    """
-    _check_image(image)
+def gpu_contrast(image: np.ndarray, alpha: float) -> np.ndarray:
+    """Ajusta contraste en la GPU. alpha > 1 aumenta, 0<alpha<1 reduce."""
+    img = _ensure_uint8_3ch(image).copy()
 
-    if not HAS_PYCUDA:
-        # CPU: aproximación usando convertScaleAbs
-        beta = midpoint * (1 - alpha)
-        return cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+    height, width, channels = img.shape
+    total = width * height * channels
 
-    height, width, channels = image.shape
-    img_flat = image.copy()
+    img_gpu = cuda.mem_alloc(img.nbytes)
+    cuda.memcpy_htod(img_gpu, img)
 
-    img_gpu = cuda.mem_alloc(img_flat.nbytes)
-    cuda.memcpy_htod(img_gpu, img_flat)
-
-    block = (16, 16, 1)
-    grid = ((width + block[0] - 1) // block[0],
-            (height + block[1] - 1) // block[1],
-            1)
+    threads_per_block = 256
+    blocks = (total + threads_per_block - 1) // threads_per_block
 
     _contrast_kernel(
         img_gpu,
@@ -185,12 +167,13 @@ def gpu_contrast(image: np.ndarray, alpha: float = 1.3, midpoint: float = 127.0)
         np.int32(height),
         np.int32(channels),
         np.float32(alpha),
-        np.float32(midpoint),
-        block=block,
-        grid=grid,
+        block=(threads_per_block, 1, 1),
+        grid=(blocks, 1, 1),
     )
 
-    result = np.empty_like(img_flat)
+    result = np.empty_like(img)
     cuda.memcpy_dtoh(result, img_gpu)
+
     img_gpu.free()
     return result
+
